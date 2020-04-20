@@ -174,12 +174,15 @@ type EC2InstanceMetadataCache struct {
 
 	// securityGroups and vpcIPv4CIDRs are potentially dynamic and
 	// should get accessed via the method getSecurityGroups and getVpcIPv4CIDRs
-	securityGroups []*string
-	vpcIPv4CIDRs   []*string
+	//
+	//TODO: do these information even need to be cached ?
+	securityGroups      []*string
+	securityGroupsMutex sync.RWMutex
+	vpcIPv4CIDRs        []*string
+	vpcIPv4CIDRsMutex   sync.RWMutex
 
 	ec2Metadata ec2metadata.EC2Metadata
 	ec2SVC      ec2wrapper.EC2
-	mu          sync.RWMutex
 }
 
 // ENIMetadata contains information about an ENI
@@ -1227,7 +1230,8 @@ func (cache *EC2InstanceMetadataCache) GetVPCIPv4CIDR() string {
 
 // GetVPCIPv4CIDRs returns VPC CIDRs
 func (cache *EC2InstanceMetadataCache) GetVPCIPv4CIDRs() []*string {
-	return cache.vpcIPv4CIDRs
+	cidrs, _ := cache.getVpcIPv4CIDRs()
+	return cidrs
 }
 
 // GetLocalIPv4 returns the primary IP address on the primary interface
@@ -1246,8 +1250,8 @@ func (cache *EC2InstanceMetadataCache) GetPrimaryENImac() string {
 }
 
 func (cache *EC2InstanceMetadataCache) getSecurityGroups() ([]*string, error) {
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	cache.securityGroupsMutex.Lock()
+	defer cache.securityGroupsMutex.Unlock()
 
 	securityGroups, err := cache.lookupSecurityGroups()
 	if err != nil {
@@ -1258,20 +1262,29 @@ func (cache *EC2InstanceMetadataCache) getSecurityGroups() ([]*string, error) {
 	return securityGroups, err
 }
 
+func (cache *EC2InstanceMetadataCache) primaryMac() (string, error) {
+	mac, err := cache.ec2Metadata.GetMetadata(metadataMAC)
+	if err != nil {
+		awsAPIErrInc("GetMetadata", err)
+		log.Errorf("Failed to retrieve primary interface MAC address from instance metadata service %v", err)
+		return "", errors.Wrap(err, "get instance metadata: failed to retrieve primary interface MAC address")
+	}
+
+	log.Debugf("Found primary interface's MAC address: %s", mac)
+
+	return mac, nil
+}
+
 func (cache *EC2InstanceMetadataCache) lookupSecurityGroups() ([]*string, error) {
 	// This check is only there to make the tests passed since ec2Metadata is not mocked.
 	if cache.ec2Metadata == nil {
 		return nil, errors.New("ec2Metadata not initialized.")
 	}
 
-	// retrieve primary interface's mac
-	mac, err := cache.ec2Metadata.GetMetadata(metadataMAC)
+	mac, err := cache.primaryMac()
 	if err != nil {
-		awsAPIErrInc("GetMetadata", err)
-		log.Errorf("Failed to retrieve primary interface MAC address from instance metadata service %v", err)
-		return nil, errors.Wrap(err, "get instance metadata: failed to retrieve primary interface MAC address")
+		return nil, err
 	}
-	log.Debugf("Found primary interface's MAC address: %s", mac)
 
 	// retrieve security groups
 	metadataSGIDs, err := cache.ec2Metadata.GetMetadata(metadataMACPath + mac + metadataSGs)
@@ -1290,4 +1303,48 @@ func (cache *EC2InstanceMetadataCache) lookupSecurityGroups() ([]*string, error)
 	}
 
 	return securityGroups, nil
+}
+
+func (cache *EC2InstanceMetadataCache) getVpcIPv4CIDRs() ([]*string, error) {
+	cache.vpcIPv4CIDRsMutex.Lock()
+	defer cache.vpcIPv4CIDRsMutex.Unlock()
+
+	cidrs, err := cache.lookupVpcIPv4CIDRs()
+	if err != nil {
+		return cache.vpcIPv4CIDRs, err
+	}
+
+	cache.vpcIPv4CIDRs = cidrs
+	return cidrs, nil
+}
+
+func (cache *EC2InstanceMetadataCache) lookupVpcIPv4CIDRs() ([]*string, error) {
+	// This check is only there to make the tests passed since ec2Metadata is not mocked.
+	if cache.ec2Metadata == nil {
+		return nil, errors.New("ec2Metadata not initialized")
+	}
+
+	mac, err := cache.primaryMac()
+	if err != nil {
+		return nil, err
+	}
+
+	// retrieve vpc-ipv4-cidr-blocks
+	metadataVPCIPv4CIDRs, err := cache.ec2Metadata.GetMetadata(metadataMACPath + mac + metadataVPCcidrs)
+	if err != nil {
+		awsAPIErrInc("GetMetadata", err)
+		log.Errorf("Failed to retrieve vpc-ipv4-cidr-blocks from instance metadata service")
+		return nil, errors.Wrap(err, "get instance metadata: failed to retrieve vpc-ipv4-cidr-block data")
+	}
+
+	vpcIPv4CIDRs := strings.Fields(metadataVPCIPv4CIDRs)
+
+	cidrs := make([]*string, 0, len(vpcIPv4CIDRs))
+
+	for _, vpcCIDR := range vpcIPv4CIDRs {
+		log.Debugf("Found VPC CIDR: %s", vpcCIDR)
+		cidrs = append(cidrs, aws.String(vpcCIDR))
+	}
+
+	return cidrs, nil
 }
