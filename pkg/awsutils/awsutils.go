@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -159,22 +160,26 @@ type APIs interface {
 // EC2InstanceMetadataCache caches instance metadata
 type EC2InstanceMetadataCache struct {
 	// metadata info
-	securityGroups   []*string
 	subnetID         string
 	cidrBlock        string
 	localIPv4        string
 	instanceID       string
 	instanceType     string
 	vpcIPv4CIDR      string
-	vpcIPv4CIDRs     []*string
 	primaryENI       string
 	primaryENImac    string
 	availabilityZone string
 	region           string
 	accountID        string
 
+	// securityGroups and vpcIPv4CIDRs are potentially dynamic and
+	// should get accessed via the method getSecurityGroups and getVpcIPv4CIDRs
+	securityGroups []*string
+	vpcIPv4CIDRs   []*string
+
 	ec2Metadata ec2metadata.EC2Metadata
 	ec2SVC      ec2wrapper.EC2
+	mu          sync.RWMutex
 }
 
 // ENIMetadata contains information about an ENI
@@ -653,9 +658,15 @@ func (cache *EC2InstanceMetadataCache) attachENI(eniID string) (string, error) {
 // return ENI id, error
 func (cache *EC2InstanceMetadataCache) createENI(useCustomCfg bool, sg []*string, subnet string) (string, error) {
 	eniDescription := eniDescriptionPrefix + cache.instanceID
+
+	securityGroups, err := cache.getSecurityGroups()
+	if err != nil {
+		log.Debugf("Failed to refresh the security groups, using the cached ones: %v", err)
+	}
+
 	input := &ec2.CreateNetworkInterfaceInput{
 		Description: aws.String(eniDescription),
-		Groups:      cache.securityGroups,
+		Groups:      securityGroups,
 		SubnetId:    aws.String(cache.subnetID),
 	}
 
@@ -1232,4 +1243,51 @@ func (cache *EC2InstanceMetadataCache) GetPrimaryENI() string {
 // GetPrimaryENImac returns the mac address of primary eni
 func (cache *EC2InstanceMetadataCache) GetPrimaryENImac() string {
 	return cache.primaryENImac
+}
+
+func (cache *EC2InstanceMetadataCache) getSecurityGroups() ([]*string, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	securityGroups, err := cache.lookupSecurityGroups()
+	if err != nil {
+		return cache.securityGroups, err
+	}
+
+	cache.securityGroups = securityGroups
+	return securityGroups, err
+}
+
+func (cache *EC2InstanceMetadataCache) lookupSecurityGroups() ([]*string, error) {
+	// This check is only there to make the tests passed since ec2Metadata is not mocked.
+	if cache.ec2Metadata == nil {
+		return nil, errors.New("ec2Metadata not initialized.")
+	}
+
+	// retrieve primary interface's mac
+	mac, err := cache.ec2Metadata.GetMetadata(metadataMAC)
+	if err != nil {
+		awsAPIErrInc("GetMetadata", err)
+		log.Errorf("Failed to retrieve primary interface MAC address from instance metadata service %v", err)
+		return nil, errors.Wrap(err, "get instance metadata: failed to retrieve primary interface MAC address")
+	}
+	log.Debugf("Found primary interface's MAC address: %s", mac)
+
+	// retrieve security groups
+	metadataSGIDs, err := cache.ec2Metadata.GetMetadata(metadataMACPath + mac + metadataSGs)
+	if err != nil {
+		awsAPIErrInc("GetMetadata", err)
+		log.Errorf("Failed to retrieve security-group-ids data from instance metadata service, %v", err)
+		return nil, errors.Wrap(err, "get instance metadata: failed to retrieve security-group-ids")
+	}
+	sgIDs := strings.Fields(metadataSGIDs)
+
+	securityGroups := make([]*string, 0, len(sgIDs))
+
+	for _, sgID := range sgIDs {
+		log.Debugf("Found security-group id: %s", sgID)
+		securityGroups = append(securityGroups, aws.String(sgID))
+	}
+
+	return securityGroups, nil
 }
